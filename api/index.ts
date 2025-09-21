@@ -25,7 +25,8 @@ app.post("/api/ocr", upload.single("image"), async (req, res) => {
       return res.status(400).json({ error: "No image file provided" });
     }
     const imageBase64 = req.file.buffer.toString("base64");
-    const result = await analyzeImage(imageBase64);
+    const mimeType = req.file.mimetype || "image/jpeg";
+    const result = await analyzeImage(imageBase64, mimeType);
     if (!result.text) {
       return res.status(500).json({
         error: result.error || "Failed to extract text from image",

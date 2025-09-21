@@ -64,7 +64,7 @@ interface GeminiError {
  * @param imageBase64 The base64-encoded image data
  * @returns An object with extracted text or error details
  */
-export async function analyzeImage(imageBase64: string): Promise<{text: string | null; error?: string}> {
+export async function analyzeImage(imageBase64: string, mimeType: string = "image/jpeg"): Promise<{text: string | null; error?: string}> {
   // Check rate limit before making request
   if (!rateLimiter.canMakeRequest()) {
     const waitTime = rateLimiter.getTimeUntilNextRequest();
@@ -116,7 +116,7 @@ export async function analyzeImage(imageBase64: string): Promise<{text: string |
             },
             {
               inline_data: {
-                mime_type: "image/jpeg",
+                mime_type: mimeType || "image/jpeg",
                 data: imageBase64
               }
             }

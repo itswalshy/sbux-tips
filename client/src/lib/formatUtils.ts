@@ -30,6 +30,9 @@ export function formatOCRResult(text: string): string {
  * @returns Array of {name, hours} objects
  */
 export function extractPartnerHours(text: string): Array<{name: string, hours: number}> {
+  if (!text || typeof text !== 'string') return [];
+  // Normalize newlines
+  text = text.replace(/\r\n?/g, '\n');
   // If the text contains line breaks, process each line separately
   if (text.includes('\n')) {
     const lines = text.split('\n');
@@ -47,8 +50,15 @@ export function extractPartnerHours(text: string): Array<{name: string, hours: n
     return result;
   }
   
-  // For single-line text, use the traditional approach
-  return extractMultiplePartnersFromText(text);
+  // For single-line text, use the traditional approach and then dedupe
+  const items = extractMultiplePartnersFromText(text);
+  const map = new Map<string, number>();
+  for (const p of items) {
+    const key = p.name.replace(/\s+/g, ' ').trim();
+    if (!key) continue;
+    map.set(key, p.hours);
+  }
+  return Array.from(map.entries()).map(([name, hours]) => ({ name, hours }));
 }
 
 // Extract name and hours from a single formatted line (e.g., "John Smith: 32")
@@ -98,22 +108,25 @@ function extractMultiplePartnersFromText(text: string): Array<{name: string, hou
   const result: Array<{name: string, hours: number}> = [];
   
   // Clean up text
-  const cleanedText = text.replace(/\s+/g, ' ').trim();
+  const cleanedText = text
+    .replace(/[•·]\s*/g, '\n')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
   
   // Different patterns that might appear in schedule images
   const patterns = [
     // Pattern: Name: 32 hours
-    /([A-Za-z\s]+)[\s\-:]+(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)[\s\-:]+(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
     // Pattern: Name (32 hours)
-    /([A-Za-z\s]+)\s*\((\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)\)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s*\((\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)\)/gi,
     // Pattern: Name - 32 hours
-    /([A-Za-z\s]+)\s*-\s*(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
     // Pattern: Name 32h 
-    /([A-Za-z\s]+)\s+(\d+(?:\.\d+)?)\s*h(?:\b|ours|rs)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s+(\d+(?:\.\d+)?)\s*h(?:\b|ours|rs)/gi,
     // Pattern: Name: 32
-    /([A-Za-z\s]+)[\s\-:]+(\d+(?:\.\d+)?)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)[\s\-:]+(\d+(?:\.\d+)?)/gi,
     // Last resort - lines with name and a number
-    /([A-Za-z\s\.]+)\s+(\d+(?:\.\d+)?)/gi
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s+(\d+(?:\.\d+)?)/gi
   ];
   
   // Try each pattern until we get some results
