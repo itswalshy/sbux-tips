@@ -64,7 +64,26 @@ interface GeminiError {
  * @param imageBase64 The base64-encoded image data
  * @returns An object with extracted text or error details
  */
-export async function analyzeImage(imageBase64: string, mimeType: string = "image/jpeg"): Promise<{text: string | null; error?: string}> {
+type Provider = "gemini" | "azure-openai";
+
+interface AzureOptions {
+  endpoint?: string;
+  apiKey?: string;
+  deployment?: string;
+  apiVersion?: string;
+}
+
+interface AnalyzeOptions {
+  provider?: Provider;
+  azure?: AzureOptions;
+}
+
+export async function analyzeImage(
+  imageBase64: string,
+  mimeType: string = "image/jpeg",
+  apiKey?: string,
+  options?: AnalyzeOptions
+): Promise<{ text: string | null; error?: string }> {
   // Check rate limit before making request
   if (!rateLimiter.canMakeRequest()) {
     const waitTime = rateLimiter.getTimeUntilNextRequest();
@@ -74,21 +93,11 @@ export async function analyzeImage(imageBase64: string, mimeType: string = "imag
     };
   }
 
+  const provider: Provider = (options?.provider || (process.env.OCR_PROVIDER as Provider) || "gemini");
+
   for (let attempt = 0; attempt <= GEMINI_RATE_LIMIT_CONFIG.maxRetries; attempt++) {
     try {
-      const apiKey = process.env.GEMINI_API_KEY || "";
-      
-      if (!apiKey) {
-        console.error("No Gemini API key provided");
-        return { 
-          text: null,
-          error: "API key missing. Please configure the Gemini API key." 
-        };
-      }
-      
-      const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
-    
-    const promptText = `
+      const promptText = `
       Extract ALL TEXT from this image first. Then identify and extract ALL partner names and their tippable hours from the text.
       
       Look for patterns indicating partner names followed by hours, such as:
@@ -106,38 +115,111 @@ export async function analyzeImage(imageBase64: string, mimeType: string = "imag
       Make sure to include ALL partners mentioned in the image, not just the first one.
       If hours are not explicitly labeled, look for numeric values near names that could represent hours.
     `;
-    
-    const requestBody = {
-      contents: [
-        {
-          parts: [
-            {
-              text: promptText
-            },
-            {
-              inline_data: {
-                mime_type: mimeType || "image/jpeg",
-                data: imageBase64
-              }
-            }
-          ]
+
+      if (provider === "azure-openai") {
+        const endpoint = options?.azure?.endpoint || process.env.AZURE_OPENAI_ENDPOINT || "";
+        const deployment = options?.azure?.deployment || process.env.AZURE_OPENAI_DEPLOYMENT || "";
+        const azureKey = options?.azure?.apiKey || apiKey || process.env.AZURE_OPENAI_API_KEY || "";
+        const apiVersion = options?.azure?.apiVersion || process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview";
+
+        if (!endpoint || !deployment || !azureKey) {
+          return {
+            text: null,
+            error: "Azure OpenAI configuration missing (endpoint/deployment/api key).",
+          };
         }
-      ],
-      generationConfig: {
-        temperature: 0.1,
-        topP: 0.8,
-        topK: 40,
-        maxOutputTokens: 2048,
-      }
-    };
-    
-      const response = await fetch(`${apiUrl}?key=${apiKey}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(requestBody)
-      });
+
+        const url = `${endpoint.replace(/\/$/, "")}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`;
+
+        const payload = {
+          messages: [
+            { role: "system", content: "You are an OCR and parsing assistant. Return only the extracted text and partner lines." },
+            {
+              role: "user",
+              content: [
+                { type: "text", text: promptText },
+                { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
+              ],
+            },
+          ],
+          temperature: 0.1,
+          max_tokens: 2048,
+          top_p: 0.8,
+        };
+
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "api-key": azureKey,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error("Azure OpenAI API error:", response.status, errorText);
+          return { text: null, error: `API Error (${response.status}): Failed to call Azure OpenAI` };
+        }
+
+        const data = await response.json() as any;
+        const content = data?.choices?.[0]?.message?.content;
+        let extracted = "";
+        if (Array.isArray(content)) {
+          extracted = content.map((c: any) => c?.text).filter(Boolean).join("\n");
+        } else if (typeof content === "string") {
+          extracted = content;
+        }
+
+        if (!extracted) {
+          return { text: null, error: "No text extracted from the image. Try a clearer image or manual entry." };
+        }
+
+        return { text: extracted };
+      } else {
+        // Default: Google Gemini
+        const geminiKey = apiKey || process.env.GEMINI_API_KEY || "";
+        if (!geminiKey) {
+          console.error("No Gemini API key provided");
+          return {
+            text: null,
+            error: "API key missing. Please configure the Gemini API key.",
+          };
+        }
+
+        const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
+
+        const requestBody = {
+          contents: [
+            {
+              parts: [
+                {
+                  text: promptText,
+                },
+                {
+                  inline_data: {
+                    mime_type: mimeType || "image/jpeg",
+                    data: imageBase64,
+                  },
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.1,
+            topP: 0.8,
+            topK: 40,
+            maxOutputTokens: 2048,
+          },
+        };
+
+        const response = await fetch(`${apiUrl}?key=${geminiKey}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(requestBody),
+        });
       
       if (!response.ok) {
         const errorText = await response.text();
@@ -186,29 +268,30 @@ export async function analyzeImage(imageBase64: string, mimeType: string = "imag
         };
       }
     
-      const data = await response.json() as GeminiResponse;
-      
-      if (!data.candidates || data.candidates.length === 0) {
-        console.error("No candidates in Gemini response");
-        return { 
-          text: null,
-          error: "No text extracted from the image. Try a clearer image or manual entry."
-        };
+        const data = await response.json() as GeminiResponse;
+        
+        if (!data.candidates || data.candidates.length === 0) {
+          console.error("No candidates in Gemini response");
+          return { 
+            text: null,
+            error: "No text extracted from the image. Try a clearer image or manual entry."
+          };
+        }
+        
+        const extractedText = data.candidates[0].content.parts
+          .map(part => part.text)
+          .filter(Boolean)
+          .join("\n");
+        
+        if (!extractedText) {
+          return { 
+            text: null,
+            error: "No text extracted from the image. Try a clearer image or manual entry."
+          };
+        }
+        
+        return { text: extractedText };
       }
-      
-      const extractedText = data.candidates[0].content.parts
-        .map(part => part.text)
-        .filter(Boolean)
-        .join("\n");
-      
-      if (!extractedText) {
-        return { 
-          text: null,
-          error: "No text extracted from the image. Try a clearer image or manual entry."
-        };
-      }
-      
-      return { text: extractedText };
       
     } catch (error) {
       // If this is the last attempt, return the error
