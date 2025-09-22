@@ -64,7 +64,7 @@ interface GeminiError {
  * @param imageBase64 The base64-encoded image data
  * @returns An object with extracted text or error details
  */
-type Provider = "gemini" | "azure-openai";
+type Provider = "gemini" | "azure-openai" | "azure-vision";
 
 interface AzureOptions {
   endpoint?: string;
@@ -73,9 +73,16 @@ interface AzureOptions {
   apiVersion?: string;
 }
 
+interface AzureVisionOptions {
+  endpoint?: string;
+  apiKey?: string;
+  apiVersion?: string;
+}
+
 interface AnalyzeOptions {
   provider?: Provider;
   azure?: AzureOptions;
+  azureVision?: AzureVisionOptions;
 }
 
 export async function analyzeImage(
@@ -176,6 +183,90 @@ export async function analyzeImage(
         }
 
         return { text: extracted };
+      } else if (provider === "azure-vision") {
+        // Azure Computer Vision Read API
+        const endpoint = options?.azureVision?.endpoint || process.env.AZURE_VISION_ENDPOINT || "";
+        const visionKey = options?.azureVision?.apiKey || apiKey || process.env.AZURE_VISION_API_KEY || "";
+        const apiVersion = options?.azureVision?.apiVersion || process.env.AZURE_VISION_API_VERSION || "2023-02-01-preview";
+
+        if (!endpoint || !visionKey) {
+          return {
+            text: null,
+            error: "Azure Vision configuration missing (endpoint/api key).",
+          };
+        }
+
+        // Step 1: Submit image for analysis
+        const analyzeUrl = `${endpoint.replace(/\/$/, "")}/vision/v3.2/read/analyze?api-version=${apiVersion}`;
+        
+        const analyzeResponse = await fetch(analyzeUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "Ocp-Apim-Subscription-Key": visionKey,
+          },
+          body: Buffer.from(imageBase64, 'base64'),
+        });
+
+        if (!analyzeResponse.ok) {
+          const errorText = await analyzeResponse.text();
+          console.error("Azure Vision API error:", analyzeResponse.status, errorText);
+          return { text: null, error: `API Error (${analyzeResponse.status}): Failed to call Azure Vision` };
+        }
+
+        // Get operation location from response headers
+        const operationLocation = analyzeResponse.headers.get('Operation-Location');
+        if (!operationLocation) {
+          return { text: null, error: "Azure Vision: No operation location returned" };
+        }
+
+        // Step 2: Poll for results
+        let resultResponse;
+        let attempts = 0;
+        const maxAttempts = 30; // 30 seconds max wait
+        
+        do {
+          await sleep(1000); // Wait 1 second between polls
+          attempts++;
+          
+          resultResponse = await fetch(operationLocation, {
+            headers: {
+              "Ocp-Apim-Subscription-Key": visionKey,
+            },
+          });
+
+          if (!resultResponse.ok) {
+            const errorText = await resultResponse.text();
+            console.error("Azure Vision result error:", resultResponse.status, errorText);
+            return { text: null, error: `Failed to get OCR results: ${resultResponse.status}` };
+          }
+
+          const result = await resultResponse.json() as any;
+          
+          if (result.status === "succeeded") {
+            // Extract text from read results
+            const pages = result.analyzeResult?.readResults || [];
+            let extractedText = "";
+            
+            for (const page of pages) {
+              for (const line of page.lines || []) {
+                extractedText += line.text + "\n";
+              }
+            }
+
+            if (!extractedText.trim()) {
+              return { text: null, error: "No text extracted from the image. Try a clearer image or manual entry." };
+            }
+
+            return { text: extractedText.trim() };
+          } else if (result.status === "failed") {
+            return { text: null, error: "Azure Vision OCR failed to process the image." };
+          }
+          
+          // Status is still "running" or "notStarted", continue polling
+        } while (attempts < maxAttempts);
+
+        return { text: null, error: "Azure Vision OCR timed out. Please try again." };
       } else {
         // Default: Google Gemini
         const geminiKey = apiKey || process.env.GEMINI_API_KEY || "";

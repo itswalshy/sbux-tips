@@ -34,7 +34,12 @@ app.post("/api/ocr", upload.single("image"), async (req, res) => {
       deployment: (req.headers["x-azure-deployment"] as string) || undefined,
       apiVersion: (req.headers["x-azure-api-version"] as string) || undefined,
     };
-    const result = await analyzeImage(imageBase64, mimeType, userGeminiKey, { provider, azure });
+    const azureVision = {
+      endpoint: (req.headers["x-azure-vision-endpoint"] as string) || undefined,
+      apiKey: (req.headers["x-azure-vision-key"] as string) || undefined,
+      apiVersion: (req.headers["x-azure-vision-api-version"] as string) || undefined,
+    };
+    const result = await analyzeImage(imageBase64, mimeType, userGeminiKey, { provider, azure, azureVision });
     if (!result.text) {
       return res.status(500).json({
         error: result.error || "Failed to extract text from image",
