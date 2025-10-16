@@ -1,5 +1,9 @@
 import { DistributionData } from "@shared/schema";
 import PartnerCard from "./PartnerCard";
+import { useTipContext } from "@/context/TipContext";
+import { roundAndCalculateBills } from "@/lib/billCalc";
+
+type BillBreakdown = Array<{ denomination: number; quantity: number }>;
 
 type PartnerPayoutsListProps = {
   distributionData: DistributionData;
@@ -17,6 +21,7 @@ const getBillClass = (billStr: string): string => {
 };
 
 export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsListProps) {
+  const { setDistributionData } = useTipContext();
   const { partnerPayouts, hourlyRate, totalAmount, totalHours } = distributionData;
   
   if (!partnerPayouts || partnerPayouts.length === 0) {
@@ -33,6 +38,57 @@ export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsL
     });
   });
   
+  const handleBillBreakdownChange = (index: number, billBreakdown: BillBreakdown) => {
+    const totalFromBills = billBreakdown.reduce((sum, bill) => sum + bill.denomination * bill.quantity, 0);
+
+    setDistributionData((prev) => {
+      if (!prev) return prev;
+
+      const updatedPartnerPayouts = prev.partnerPayouts.map((partner, i) => {
+        if (i !== index) return partner;
+
+        return {
+          ...partner,
+          rounded: totalFromBills,
+          billBreakdown,
+        };
+      });
+
+      return {
+        ...prev,
+        partnerPayouts: updatedPartnerPayouts,
+      };
+    });
+  };
+
+  const handleResetBillBreakdown = (index: number) => {
+    let recalculatedBreakdown: BillBreakdown = [];
+
+    setDistributionData((prev) => {
+      if (!prev) return prev;
+
+      const updatedPartnerPayouts = prev.partnerPayouts.map((partner, i) => {
+        if (i !== index) return partner;
+
+        const { rounded, billBreakdown } = roundAndCalculateBills(partner.payout);
+        recalculatedBreakdown = billBreakdown;
+
+        return {
+          ...partner,
+          rounded,
+          billBreakdown,
+        };
+      });
+
+      return {
+        ...prev,
+        partnerPayouts: updatedPartnerPayouts,
+      };
+    });
+
+    return recalculatedBreakdown;
+  };
+
   return (
     <div className="animate-fadeIn">
       <div className="card mb-8 shadow-soft">
@@ -114,7 +170,12 @@ export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsL
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 lg:gap-6">
         {partnerPayouts.map((partner, index) => (
           <div key={index} style={{animationDelay: `${0.1 + (index * 0.05)}s`}}>
-            <PartnerCard partner={partner} hourlyRate={hourlyRate} />
+            <PartnerCard
+              partner={partner}
+              hourlyRate={hourlyRate}
+              onBillBreakdownChange={(billBreakdown) => handleBillBreakdownChange(index, billBreakdown)}
+              onResetBillBreakdown={() => handleResetBillBreakdown(index)}
+            />
           </div>
         ))}
       </div>
