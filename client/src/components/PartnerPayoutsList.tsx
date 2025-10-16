@@ -114,7 +114,7 @@ export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsL
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 lg:gap-6">
         {partnerPayouts.map((partner, index) => (
           <div key={index} style={{animationDelay: `${0.1 + (index * 0.05)}s`}}>
-            <PartnerCard partner={partner} hourlyRate={hourlyRate} />
+            <PartnerCard partner={partner} hourlyRate={hourlyRate} index={index} />
           </div>
         ))}
       </div>
