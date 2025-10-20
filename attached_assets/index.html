@@ -699,8 +699,31 @@
         };
 
         // Gemini API settings
-        const GEMINI_API_KEY = "AIzaSyCi_m_KbY-a36tvHl09C1Mtyx_K38GuokY";
-        const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent";
+        const GEMINI_API_KEY_STORAGE_KEY = "sbuxTips.geminiApiKey";
+        let GEMINI_API_KEY = window.localStorage.getItem(GEMINI_API_KEY_STORAGE_KEY) || "";
+
+        function ensureGeminiApiKey() {
+            if (GEMINI_API_KEY && GEMINI_API_KEY.trim()) {
+                GEMINI_API_KEY = GEMINI_API_KEY.trim();
+                return GEMINI_API_KEY;
+            }
+
+            const providedKey = window.prompt(
+                "Enter your Gemini API key to enable tip calculation from uploaded images:",
+            );
+
+            const sanitizedKey = (providedKey || "").trim();
+            if (!sanitizedKey) {
+                alert("A Gemini API key is required to process images.");
+                return "";
+            }
+
+            GEMINI_API_KEY = sanitizedKey;
+            window.localStorage.setItem(GEMINI_API_KEY_STORAGE_KEY, GEMINI_API_KEY);
+            return GEMINI_API_KEY;
+        }
+
+        const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent";
 
         // DOM Elements
         const uploadSection = document.getElementById('uploadSection');
@@ -821,7 +844,12 @@
                     }
                 };
                 
-                const response = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+                const apiKey = ensureGeminiApiKey();
+                if (!apiKey) {
+                    throw new Error("Gemini API key is required to process the receipt.");
+                }
+
+                const response = await fetch(`${GEMINI_API_URL}?key=${encodeURIComponent(apiKey)}`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'
@@ -912,7 +940,12 @@
                 };
                 
                 // Make the API call to extract partner data
-                const response = await fetch(`${GEMINI_API_URL}?key=${GEMINI_API_KEY}`, {
+                const apiKey = ensureGeminiApiKey();
+                if (!apiKey) {
+                    throw new Error("Gemini API key is required to extract partner data.");
+                }
+
+                const response = await fetch(`${GEMINI_API_URL}?key=${encodeURIComponent(apiKey)}`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json'

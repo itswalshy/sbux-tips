@@ -278,7 +278,7 @@ export async function analyzeImage(
           };
         }
 
-        const apiUrl = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent";
+        const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent";
 
         const requestBody = {
           contents: [

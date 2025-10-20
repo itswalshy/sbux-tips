@@ -73,8 +73,8 @@ export async function analyzeImage(imageBase64) {
         return { text: null, error: "API key missing. Please configure the Gemini API key in environment variables." };
       }
       
-      // Google Gemini API endpoint - Updated to use Gemini 1.5 Flash
-      const endpoint = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
+      // Google Gemini API endpoint - Updated to use the latest Flash alias
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
     
       // Construct the request body with the image and prompt
       const requestBody = {
