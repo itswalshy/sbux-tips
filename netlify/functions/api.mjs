@@ -69,6 +69,12 @@ var storage = new MemStorage();
 
 // server/api/gemini.netlify.js
 import fetch from "node-fetch";
+const GEMINI_API_ENDPOINTS = [
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent",
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+];
 async function analyzeImage(imageBase64) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -76,7 +82,6 @@ async function analyzeImage(imageBase64) {
       console.error("No Gemini API key provided");
       return { text: null, error: "API key missing. Please configure the Gemini API key in environment variables." };
     }
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro-vision:generateContent?key=${apiKey}`;
     const requestBody = {
       contents: [
         {
@@ -94,26 +99,77 @@ async function analyzeImage(imageBase64) {
         }
       ]
     };
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(requestBody)
-    });
-    const responseData = await response.json();
-    if (!response.ok) {
-      console.error("Gemini API error:", responseData);
+    let lastModelError = null;
+    let lastGeneralError = null;
+    let retriedForRateLimit = false;
+    for (const endpoint of GEMINI_API_ENDPOINTS) {
+      const response = await fetch(`${endpoint}?key=${apiKey}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(requestBody)
+      });
+      const responseText = await response.text();
+      let responseData = null;
+      try {
+        responseData = JSON.parse(responseText);
+      } catch (error) {
+      }
+      if (response.ok) {
+        const extractedText = responseData?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!extractedText) {
+          return { text: null, error: "No text extracted from image" };
+        }
+        return { text: extractedText, error: null };
+      }
+      let errorMessage = responseData?.error?.message || response.statusText || "Error processing image with Gemini API";
+      errorMessage = errorMessage.replace(/api_key:[a-zA-Z0-9-_]+/, "api_key:[REDACTED]");
+      const notFound = response.status === 404 ||
+        (responseData?.error?.status === "NOT_FOUND") ||
+        /not found/i.test(errorMessage) ||
+        /not supported/i.test(errorMessage);
+      if (notFound) {
+        lastModelError = errorMessage;
+        continue;
+      }
+      const shouldRetry = response.status === 429 ||
+        errorMessage.toLowerCase().includes("quota") ||
+        errorMessage.toLowerCase().includes("rate limit") ||
+        errorMessage.toLowerCase().includes("requests per minute");
+      if (shouldRetry && attempt < RATE_LIMIT.maxRetries) {
+        const delay = Math.min(
+          RATE_LIMIT.baseDelay * Math.pow(RATE_LIMIT.backoffMultiplier, attempt),
+          RATE_LIMIT.maxDelay
+        );
+        console.log(`Rate limit hit, retrying in ${delay}ms (attempt ${attempt + 1}/${RATE_LIMIT.maxRetries + 1})`);
+        await sleep(delay);
+        retriedForRateLimit = true;
+        break;
+      }
+      console.error("Gemini API error:", responseData || response.statusText || response.status);
+      lastGeneralError = errorMessage;
+      break;
+    }
+    if (retriedForRateLimit) {
+      continue;
+    }
+    if (lastGeneralError) {
       return {
         text: null,
-        error: responseData.error?.message || "Error processing image with Gemini API"
+        error: lastGeneralError
       };
     }
-    const extractedText = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!extractedText) {
-      return { text: null, error: "No text extracted from image" };
+    if (lastModelError) {
+      return {
+        text: null,
+        error: `Gemini could not find an available "gemini-1.5-flash" model for this API key. (${lastModelError})`
+      };
     }
-    return { text: extractedText, error: null };
+    return {
+      text: null,
+      error: "Failed to process image with Gemini API"
+    };
   } catch (error) {
     console.error("Gemini API error:", error);
     return {

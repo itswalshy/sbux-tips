@@ -1,9 +1,14 @@
+import { useState } from "react";
 import { PartnerPayout } from "@shared/schema";
 import { formatCurrency } from "@/lib/utils";
+import BillBreakdownModal from "@/components/BillBreakdownModal";
+import { useTipContext } from "@/context/TipContext";
+import { useToast } from "@/hooks/use-toast";
 
 type PartnerCardProps = {
   partner: PartnerPayout;
   hourlyRate: number;
+  index: number;
 };
 
 // Get a CSS class based on denomination
@@ -17,12 +22,44 @@ const getBillClass = (denomination: number): string => {
   }
 };
 
-export default function PartnerCard({ partner, hourlyRate }: PartnerCardProps) {  
+export default function PartnerCard({ partner, hourlyRate, index }: PartnerCardProps) {
+  const [isBillModalOpen, setIsBillModalOpen] = useState(false);
+  const { setDistributionData } = useTipContext();
+  const { toast } = useToast();
+
+  const handleBillSave = (billBreakdown: PartnerPayout["billBreakdown"]) => {
+    setDistributionData((prev) => {
+      if (!prev) return prev;
+
+      const updatedPayouts = prev.partnerPayouts.map((payout, payoutIndex) =>
+        payoutIndex === index
+          ? {
+              ...payout,
+              billBreakdown,
+            }
+          : payout
+      );
+
+      return {
+        ...prev,
+        partnerPayouts: updatedPayouts,
+      };
+    });
+
+    toast({
+      title: "Bill breakdown updated",
+      description: `Custom bill counts saved for ${partner.name}.`,
+    });
+
+    setIsBillModalOpen(false);
+  };
+
   return (
-    <div className="card animate-fadeUp overflow-hidden shadow-soft gradient-border">
-      <div className="card-header flex flex-row justify-between items-center py-3">
-        <div className="flex items-center">
-          <div className="w-8 h-8 bg-[#364949] rounded-full flex items-center justify-center mr-3 border-2 border-[#93ec93]">
+    <>
+      <div className="card animate-fadeUp overflow-hidden shadow-soft gradient-border">
+        <div className="card-header flex flex-row justify-between items-center py-3">
+          <div className="flex items-center">
+            <div className="w-8 h-8 bg-[#364949] rounded-full flex items-center justify-center mr-3 border-2 border-[#93ec93]">
             <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 text-[#93ec93]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
             </svg>
@@ -60,31 +97,47 @@ export default function PartnerCard({ partner, hourlyRate }: PartnerCardProps) {
         </div>
       </div>
       
-      <div className="card-footer p-3">
-        <div className="w-full">
-          <div className="mb-2 text-sm font-medium text-[#ffeed6] flex items-center">
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
-            </svg>
-            Bill Breakdown:
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {[...partner.billBreakdown]
-              .sort((a, b) => b.denomination - a.denomination) // Sort in descending order
-              .map((bill, index) => {
-                const billClass = getBillClass(bill.denomination);
-                return (
-                  <div 
-                    key={index} 
-                    className={`px-3 py-1 rounded-full text-sm font-medium shadow-sm transition-all hover:shadow-md hover:scale-105 ${billClass}`}
-                  >
-                    {bill.quantity}×${bill.denomination}
-                  </div>
-                );
-              })}
+        <div className="card-footer p-3">
+          <div className="w-full">
+            <div className="mb-2 text-sm font-medium text-[#ffeed6] flex items-center justify-between">
+              <div className="flex items-center">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 9V7a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2m2 4h10a2 2 0 002-2v-6a2 2 0 00-2-2H9a2 2 0 00-2 2v6a2 2 0 002 2zm7-5a2 2 0 11-4 0 2 2 0 014 0z" />
+                </svg>
+                Bill Breakdown:
+              </div>
+              <button
+                className="text-xs font-medium text-[#9fd6e9] hover:text-[#93ec93] transition-colors"
+                onClick={() => setIsBillModalOpen(true)}
+              >
+                Adjust
+              </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {[...partner.billBreakdown]
+                .sort((a, b) => b.denomination - a.denomination) // Sort in descending order
+                .map((bill, index) => {
+                  const billClass = getBillClass(bill.denomination);
+                  return (
+                    <div
+                      key={index}
+                      className={`px-3 py-1 rounded-full text-sm font-medium shadow-sm transition-all hover:shadow-md hover:scale-105 ${billClass}`}
+                    >
+                      {bill.quantity}×${bill.denomination}
+                    </div>
+                  );
+                })}
+            </div>
           </div>
         </div>
       </div>
-    </div>
+
+      <BillBreakdownModal
+        isOpen={isBillModalOpen}
+        onClose={() => setIsBillModalOpen(false)}
+        partner={partner}
+        onSave={handleBillSave}
+      />
+    </>
   );
 }

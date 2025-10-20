@@ -38,6 +38,13 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
+const GEMINI_API_ENDPOINTS = [
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent",
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+];
+
 // Sleep utility function
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -278,8 +285,6 @@ export async function analyzeImage(
           };
         }
 
-        const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent";
-
         const requestBody = {
           contents: [
             {
@@ -303,85 +308,105 @@ export async function analyzeImage(
             maxOutputTokens: 2048,
           },
         };
+        let lastModelError: string | null = null;
+        let lastGeneralError: string | null = null;
+        let retriedForRateLimit = false;
 
-        const response = await fetch(`${apiUrl}?key=${geminiKey}`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(requestBody),
-        });
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        let errorMessage = "Failed to call Gemini API";
-        let shouldRetry = false;
-        
-        try {
-          const errorData = JSON.parse(errorText) as GeminiError;
-          if (errorData.error?.message) {
-            errorMessage = errorData.error.message;
-            // Hide the API key if it's in the error message
-            errorMessage = errorMessage.replace(/api_key:[a-zA-Z0-9-_]+/, "api_key:[REDACTED]");
-            
-            // Check if this is a rate limit error that we should retry
-            shouldRetry = isRateLimitError(errorData.error);
+        for (const apiUrl of GEMINI_API_ENDPOINTS) {
+          const response = await fetch(`${apiUrl}?key=${geminiKey}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(requestBody),
+          });
+
+          const responseText = await response.text();
+          let parsedBody: GeminiResponse | GeminiError | undefined;
+
+          try {
+            parsedBody = JSON.parse(responseText) as GeminiResponse | GeminiError;
+          } catch (parseError) {
+            // ignore JSON parse issues; rely on status codes below
           }
-        } catch (e) {
-          // If error parsing fails, check status code for rate limiting
-          shouldRetry = isRateLimitError({ code: response.status });
-        }
-        
-        // If this is a rate limit error and we have retries left, wait and retry
-        if (shouldRetry && attempt < GEMINI_RATE_LIMIT_CONFIG.maxRetries) {
-          const delay = Math.min(
-            GEMINI_RATE_LIMIT_CONFIG.baseDelay * Math.pow(GEMINI_RATE_LIMIT_CONFIG.backoffMultiplier, attempt),
-            GEMINI_RATE_LIMIT_CONFIG.maxDelay
+
+          if (response.ok) {
+            const responseData = parsedBody as GeminiResponse | undefined;
+            const extractedText = responseData?.candidates?.[0]?.content?.parts
+              ?.map(part => part.text)
+              .filter(Boolean)
+              .join("\n");
+
+            if (!extractedText) {
+              return {
+                text: null,
+                error: "No text extracted from the image. Try a clearer image or manual entry.",
+              };
+            }
+
+            return { text: extractedText };
+          }
+
+          const errorData = parsedBody as GeminiError | undefined;
+          let errorMessage = errorData?.error?.message || response.statusText || "Failed to call Gemini API";
+          errorMessage = errorMessage.replace(/api_key:[a-zA-Z0-9-_]+/, "api_key:[REDACTED]");
+
+          const notFound = (
+            response.status === 404 ||
+            errorData?.error?.status === "NOT_FOUND" ||
+            /not found/i.test(errorMessage) ||
+            /not supported/i.test(errorMessage)
           );
-          console.log(`Rate limit hit, retrying in ${delay}ms (attempt ${attempt + 1}/${GEMINI_RATE_LIMIT_CONFIG.maxRetries + 1})`);
-          await sleep(delay);
-          continue; // Retry the request
+
+          if (notFound) {
+            lastModelError = errorMessage;
+            continue;
+          }
+
+          const shouldRetry = isRateLimitError({
+            code: response.status,
+            message: errorMessage,
+            status: errorData?.error?.status,
+          });
+
+          if (shouldRetry && attempt < GEMINI_RATE_LIMIT_CONFIG.maxRetries) {
+            const delay = Math.min(
+              GEMINI_RATE_LIMIT_CONFIG.baseDelay * Math.pow(GEMINI_RATE_LIMIT_CONFIG.backoffMultiplier, attempt),
+              GEMINI_RATE_LIMIT_CONFIG.maxDelay
+            );
+            console.log(`Rate limit hit, retrying in ${delay}ms (attempt ${attempt + 1}/${GEMINI_RATE_LIMIT_CONFIG.maxRetries + 1})`);
+            await sleep(delay);
+            retriedForRateLimit = true;
+            break;
+          }
+
+          console.error("Gemini API error:", response.status, responseText);
+
+          if (isRateLimitError({ code: response.status, message: errorMessage, status: errorData?.error?.status })) {
+            return {
+              text: null,
+              error: GEMINI_RATE_LIMIT_CONFIG.messages.quotaExceeded,
+            };
+          }
+
+          lastGeneralError = `API Error (${response.status}): ${errorMessage}`;
+          break;
         }
-        
-        console.error("Gemini API error:", response.status, errorText);
-        
-        // Provide user-friendly error messages for quota issues
-        if (isRateLimitError({ code: response.status, message: errorMessage })) {
-          return { 
-            text: null, 
-            error: GEMINI_RATE_LIMIT_CONFIG.messages.quotaExceeded
-          };
+
+        if (retriedForRateLimit) {
+          continue;
         }
-        
-        return { 
-          text: null, 
-          error: `API Error (${response.status}): ${errorMessage}`
+
+        if (lastGeneralError) {
+          return { text: null, error: lastGeneralError };
+        }
+
+        return {
+          text: null,
+          error: lastModelError
+            ? `Gemini could not find an available \"gemini-1.5-flash\" model for this API key. (${lastModelError})`
+            : "Failed to call Gemini API.",
         };
-      }
-    
-        const data = await response.json() as GeminiResponse;
-        
-        if (!data.candidates || data.candidates.length === 0) {
-          console.error("No candidates in Gemini response");
-          return { 
-            text: null,
-            error: "No text extracted from the image. Try a clearer image or manual entry."
-          };
-        }
-        
-        const extractedText = data.candidates[0].content.parts
-          .map(part => part.text)
-          .filter(Boolean)
-          .join("\n");
-        
-        if (!extractedText) {
-          return { 
-            text: null,
-            error: "No text extracted from the image. Try a clearer image or manual entry."
-          };
-        }
-        
-        return { text: extractedText };
       }
       
     } catch (error) {

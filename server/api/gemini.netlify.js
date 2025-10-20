@@ -46,6 +46,13 @@ class RateLimiter {
 
 const rateLimiter = new RateLimiter();
 
+const GEMINI_API_ENDPOINTS = [
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash-latest:generateContent",
+  "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent",
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+];
+
 // Sleep utility function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -73,10 +80,6 @@ export async function analyzeImage(imageBase64) {
         return { text: null, error: "API key missing. Please configure the Gemini API key in environment variables." };
       }
       
-      // Google Gemini API endpoint - Updated to use Gemini 1.5 Flash
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-    
-      // Construct the request body with the image and prompt
       const requestBody = {
         contents: [
           {
@@ -84,19 +87,19 @@ export async function analyzeImage(imageBase64) {
               {
                 text: `
                   Extract ALL TEXT from this image first. Then identify and extract ALL partner names and their tippable hours from the text.
-                  
+
                   Look for patterns indicating partner names followed by hours, such as:
                   - "Name: X hours" or "Name: Xh"
                   - "Name - X hours"
                   - "Name (X hours)"
                   - Any text that includes names with numeric values that could represent hours
-                  
+
                   Return EACH partner's full name followed by their hours, with one partner per line.
                   Format the output exactly like this:
                   John Smith: 32
                   Maria Garcia: 24.5
                   Alex Johnson: 18.75
-                  
+
                   Make sure to include ALL partners mentioned in the image, not just the first one.
                   If hours are not explicitly labeled, look for numeric values near names that could represent hours.
                 `
@@ -117,32 +120,54 @@ export async function analyzeImage(imageBase64) {
           maxOutputTokens: 2048,
         }
       };
-      
-      // Make the API call
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(requestBody)
-      });
-      
-      // Parse the response
-      const responseData = await response.json();
-      
-      if (!response.ok) {
-        let shouldRetry = false;
-        let errorMessage = responseData.error?.message || "Error processing image with Gemini API";
-        
-        // Check if this is a rate limit error that we should retry
-        if (response.status === 429 || 
-            errorMessage.includes('quota') || 
-            errorMessage.includes('rate limit') ||
-            errorMessage.includes('requests per minute')) {
-          shouldRetry = true;
+
+      let lastModelError = null;
+      let lastGeneralError = null;
+      let retriedForRateLimit = false;
+
+      for (const endpoint of GEMINI_API_ENDPOINTS) {
+        const response = await fetch(`${endpoint}?key=${apiKey}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestBody)
+        });
+
+        const responseText = await response.text();
+        let responseData = null;
+        try {
+          responseData = JSON.parse(responseText);
+        } catch (parseError) {
+          // ignore JSON parse issues and fall back to status codes
         }
-        
-        // If this is a rate limit error and we have retries left, wait and retry
+
+        if (response.ok) {
+          const extractedText = responseData?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!extractedText) {
+            return { text: null, error: 'No text extracted from image' };
+          }
+          return { text: extractedText, error: null };
+        }
+
+        let errorMessage = responseData?.error?.message || response.statusText || 'Error processing image with Gemini API';
+        errorMessage = errorMessage.replace(/api_key:[a-zA-Z0-9-_]+/, 'api_key:[REDACTED]');
+
+        const notFound = response.status === 404 ||
+          responseData?.error?.status === 'NOT_FOUND' ||
+          /not found/i.test(errorMessage) ||
+          /not supported/i.test(errorMessage);
+
+        if (notFound) {
+          lastModelError = errorMessage;
+          continue;
+        }
+
+        const shouldRetry = response.status === 429 ||
+          errorMessage.toLowerCase().includes('quota') ||
+          errorMessage.toLowerCase().includes('rate limit') ||
+          errorMessage.toLowerCase().includes('requests per minute');
+
         if (shouldRetry && attempt < RATE_LIMIT.maxRetries) {
           const delay = Math.min(
             RATE_LIMIT.baseDelay * Math.pow(RATE_LIMIT.backoffMultiplier, attempt),
@@ -150,24 +175,37 @@ export async function analyzeImage(imageBase64) {
           );
           console.log(`Rate limit hit, retrying in ${delay}ms (attempt ${attempt + 1}/${RATE_LIMIT.maxRetries + 1})`);
           await sleep(delay);
-          continue; // Retry the request
+          retriedForRateLimit = true;
+          break;
         }
-        
-        console.error("Gemini API error:", responseData);
-        return { 
-          text: null, 
-          error: errorMessage
+
+        console.error('Gemini API error:', responseData || response.statusText || response.status);
+        lastGeneralError = errorMessage;
+        break;
+      }
+
+      if (retriedForRateLimit) {
+        continue;
+      }
+
+      if (lastGeneralError) {
+        return {
+          text: null,
+          error: lastGeneralError
         };
       }
-      
-      // Extract text from Gemini response
-      const extractedText = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-      
-      if (!extractedText) {
-        return { text: null, error: "No text extracted from image" };
+
+      if (lastModelError) {
+        return {
+          text: null,
+          error: `Gemini could not find an available "gemini-1.5-flash" model for this API key. (${lastModelError})`
+        };
       }
-      
-      return { text: extractedText, error: null };
+
+      return {
+        text: null,
+        error: 'Failed to process image with Gemini API'
+      };
       
     } catch (error) {
       // If this is the last attempt, return the error
