@@ -723,6 +723,67 @@
             return GEMINI_API_KEY;
         }
 
+        function buildJsonPrompt2() {
+            return `You are an OCR and schedule parsing assistant. Carefully transcribe every legible character in the provided image.
+
+Return **only** a JSON object that matches this schema exactly:
+{
+  "extracted_text": "<full transcription with line breaks>",
+  "partners": [
+    {
+      "name": "Full Name",
+      "hours": 0
+    }
+  ]
+}
+
+Guidelines:
+- Preserve the order of the names as they appear from top to bottom or left to right.
+- Use decimal hours where necessary (e.g. 23.5 for 23 hours 30 minutes).
+- Include every partner or employee that has associated hours. If none exist, return an empty array.
+- Do not include commentary, code fences, or additional fields.
+- Ensure the JSON is valid and parsable.`;
+        }
+
+        function parseModelResponse2(rawText) {
+            if (!rawText) {
+                return { extractedText: '', partners: [] };
+            }
+
+            try {
+                const parsed = JSON.parse(rawText);
+                const extractedText = typeof parsed.extracted_text === 'string' ? parsed.extracted_text.trim() : '';
+                const partners = Array.isArray(parsed.partners)
+                    ? parsed.partners.map(entry => {
+                        if (!entry || typeof entry !== 'object') {
+                            return null;
+                        }
+
+                        const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+                        const hoursValue = typeof entry.hours === 'number'
+                            ? entry.hours
+                            : typeof entry.hours === 'string'
+                                ? parseFloat(entry.hours)
+                                : NaN;
+
+                        if (!name || Number.isNaN(hoursValue)) {
+                            return null;
+                        }
+
+                        return { name, hours: hoursValue };
+                    }).filter(Boolean)
+                    : [];
+
+                return { extractedText, partners };
+            } catch (error) {
+                const cleaned = rawText.trim();
+                return {
+                    extractedText: cleaned,
+                    partners: cleaned ? extractPartnerHours(cleaned) : []
+                };
+            }
+        }
+
         const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent";
 
         // DOM Elements
@@ -815,18 +876,11 @@
                 // Step 1: Process the image
                 const base64Image = convertBase64ForGemini(state.imageData);
                 
-                const promptText = "Please analyze this image and: " +
-                    "1. Extract all visible text, especially focusing on names and hours worked " +
-                    "2. Maintain the original formatting and structure " +
-                    "3. Preserve any important visual context " +
-                    "4. Make sure to clearly identify all partner/employee names and their corresponding hours " +
-                    "Extract and format the text clearly:";
-                
                 const payload = {
                     contents: [
                         {
                             parts: [
-                                { text: promptText },
+                                { text: buildJsonPrompt2() },
                                 {
                                     inline_data: {
                                         mime_type: "image/jpeg",
@@ -837,10 +891,11 @@
                         }
                     ],
                     generationConfig: {
-                        temperature: 0.4,
+                        temperature: 0.2,
                         topK: 32,
-                        topP: 1,
+                        topP: 0.9,
                         maxOutputTokens: 2048,
+                        responseMimeType: "application/json"
                     }
                 };
                 
@@ -863,29 +918,49 @@
                 
                 const responseData = await response.json();
                 
-                if (responseData.candidates && 
-                    responseData.candidates[0] && 
-                    responseData.candidates[0].content && 
-                    responseData.candidates[0].content.parts && 
-                    responseData.candidates[0].content.parts[0] && 
-                    responseData.candidates[0].content.parts[0].text) {
-                    
-                    state.ocrResult = responseData.candidates[0].content.parts[0].text;
-                    
+                const parts = (responseData.candidates && responseData.candidates[0]?.content?.parts) || [];
+                const combined = parts.map(part => part?.text).filter(Boolean).join("\n");
+                const parsed = parseModelResponse2(combined);
+
+                if (!parsed.extractedText && (!parsed.partners || parsed.partners.length === 0)) {
+                    throw new Error('Could not parse OCR results from the API response');
+                }
+
+                state.ocrResult = parsed.extractedText || '';
+                let partnerData = Array.isArray(parsed.partners) ? parsed.partners : [];
+
+                if (partnerData.length === 0 && state.ocrResult) {
+                    partnerData = extractPartnerHours(state.ocrResult);
+                }
+
+                if (!state.ocrResult && partnerData.length > 0) {
+                    state.ocrResult = partnerData.map(p => `${p.name}: ${p.hours}`).join("\n");
+                }
+
+                state.partnerData = partnerData.map((partner, index) => ({
+                    ...partner,
+                    hours: typeof partner.hours === 'number' ? partner.hours : parseFloat(partner.hours),
+                    number: index + 1
+                })).filter(partner => partner.name && !Number.isNaN(partner.hours));
+
+                if (state.partnerData.length === 0) {
+                    throw new Error('No partners detected in the OCR results.');
+                }
+
                     // Show preview
                     previewSection.classList.remove('hidden');
                     previewImage.src = state.imageData;
-                    
+
                     // Store extracted text but don't display the section
                     extractedText.textContent = state.ocrResult;
-                    
+
                     // Show download option for OCR text
                     downloadSection.classList.remove('hidden');
                     updateDownloadLinks();
-                    
+
                     // Step 2: Automatically extract partner data
                     this.textContent = 'Extracting Partner Data...';
-                    const success = await extractPartnerData();
+                    const success = extractPartnerData();
                     
                     if (success) {
                         // Hide extractedTextSection if it's visible (in case it was shown before)
@@ -906,100 +981,38 @@
         });
 
         // Extract partner data function (now called automatically by the process button)
-        async function extractPartnerData() {
-            if (!state.ocrResult) return false;
-            
+        function extractPartnerData() {
             try {
-                // Prepare the prompt for partner data extraction
-                const extractionPrompt = 
-                    `From the following text, extract partner names and their hours worked. Format as JSON:\n\n` +
-                    `${state.ocrResult}\n\n` +
-                    `Return a JSON array of objects with 'name' and 'hours' fields. Example:
-                    [
-                        {"name": "John Smith", "hours": 32.5},
-                        {"name": "Jane Doe", "hours": 28.75}
-                    ]
-                    
-                    Only include valid partners with hours. Output ONLY the JSON array, nothing else.`;
-                
-                // Prepare the request payload
-                const payload = {
-                    contents: [
-                        {
-                            parts: [
-                                { text: extractionPrompt }
-                            ]
-                        }
-                    ],
-                    generationConfig: {
-                        temperature: 0.2,
-                        topK: 40,
-                        topP: 0.95,
-                        maxOutputTokens: 2048,
-                    }
-                };
-                
-                // Make the API call to extract partner data
-                const apiKey = ensureGeminiApiKey();
-                if (!apiKey) {
-                    throw new Error("Gemini API key is required to extract partner data.");
+                const partnerData = (state.partnerData || []).map((partner, index) => ({
+                    ...partner,
+                    number: partner.number || index + 1,
+                    hours: typeof partner.hours === 'number' ? partner.hours : parseFloat(partner.hours)
+                })).filter(partner => partner.name && !Number.isNaN(partner.hours));
+
+                if (partnerData.length === 0) {
+                    throw new Error('No partner data available to display.');
                 }
 
-                const response = await fetch(`${GEMINI_API_URL}?key=${encodeURIComponent(apiKey)}`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(payload)
-                });
-                
-                if (!response.ok) {
-                    throw new Error(`Gemini API error: ${response.status} ${response.statusText}`);
-                }
-                
-                const responseData = await response.json();
-                const partnerDataText = responseData.candidates[0].content.parts[0].text;
-                
-                // Extract JSON from the response
-                const jsonMatch = partnerDataText.match(/\[\s*{[\s\S]*}\s*\]/);
-                let partnerData = [];
-                
-                if (jsonMatch) {
-                    try {
-                        partnerData = JSON.parse(jsonMatch[0]);
-                    } catch (e) {
-                        throw new Error('Failed to parse JSON from API response');
-                    }
-                } else {
-                    throw new Error('No valid JSON found in the API response');
-                }
-                
-                // Add partner numbers
-                partnerData.forEach((partner, index) => {
-                    partner.number = index + 1;
-                });
-                
-                // Calculate total hours
-                state.totalHours = partnerData.reduce((sum, partner) => sum + parseFloat(partner.hours), 0);
                 state.partnerData = partnerData;
-                
+                state.totalHours = partnerData.reduce((sum, partner) => sum + parseFloat(partner.hours), 0);
+
                 // Update UI
                 totalHours.textContent = `Total Hours: ${state.totalHours}`;
                 partnerList.innerHTML = '';
-                
+
                 partnerData.forEach(partner => {
                     const partnerEl = document.createElement('div');
                     partnerEl.classList.add('text-sm', 'mb-1');
                     partnerEl.textContent = `${partner.name} - ${partner.hours} hours`;
                     partnerList.appendChild(partnerEl);
                 });
-                
+
                 // Show partner data section
                 partnerDataSection.classList.remove('hidden');
-                
+
                 // Scroll to partner data section
                 partnerDataSection.scrollIntoView({behavior: 'smooth'});
-                
+
                 return true;
             } catch (error) {
                 console.error('Error extracting partner data:', error);

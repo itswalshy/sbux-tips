@@ -69,12 +69,65 @@ var storage = new MemStorage();
 
 // server/api/gemini.netlify.js
 import fetch from "node-fetch";
+function buildJsonPrompt2() {
+  return `You are an OCR and schedule parsing assistant. Carefully transcribe every legible character in the provided image.
+
+Return **only** a JSON object that matches this schema exactly:
+{
+  "extracted_text": "<full transcription with line breaks>",
+  "partners": [
+    {
+      "name": "Full Name",
+      "hours": 0
+    }
+  ]
+}
+
+Guidelines:
+- Preserve the order of the names as they appear from top to bottom or left to right.
+- Use decimal hours where necessary (e.g. 23.5 for 23 hours 30 minutes).
+- Include every partner or employee that has associated hours. If none exist, return an empty array.
+- Do not include commentary, code fences, or additional fields.
+- Ensure the JSON is valid and parsable.`;
+}
+function parseModelResponse2(rawText) {
+  if (!rawText) {
+    return { extractedText: null, partners: [] };
+  }
+  try {
+    const parsed = JSON.parse(rawText);
+    const extractedText = typeof parsed.extracted_text === "string" ? parsed.extracted_text.trim() : null;
+    const partners = Array.isArray(parsed.partners)
+      ? parsed.partners.map((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return null;
+          }
+          const name = typeof entry.name === "string" ? entry.name.trim() : "";
+          const hoursValue = typeof entry.hours === "number" ? entry.hours : typeof entry.hours === "string" ? parseFloat(entry.hours) : NaN;
+          if (!name || Number.isNaN(hoursValue)) {
+            return null;
+          }
+          return { name, hours: hoursValue };
+        }).filter(Boolean)
+      : [];
+    return {
+      extractedText: extractedText ?? (typeof rawText === "string" ? rawText.trim() : null),
+      partners
+    };
+  } catch (error) {
+    const cleaned = rawText.trim();
+    return {
+      extractedText: cleaned || null,
+      partners: cleaned ? extractPartnerHours(cleaned) : []
+    };
+  }
+}
 async function analyzeImage(imageBase64) {
   try {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       console.error("No Gemini API key provided");
-      return { text: null, error: "API key missing. Please configure the Gemini API key in environment variables." };
+      return { text: null, partners: [], error: "API key missing. Please configure the Gemini API key in environment variables." };
     }
     const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
     const requestBody = {
@@ -82,7 +135,7 @@ async function analyzeImage(imageBase64) {
         {
           parts: [
             {
-              text: "Extract and format all text from this image. Focus on any tabular data listing names and hours. Format as plain text."
+              text: buildJsonPrompt2()
             },
             {
               inline_data: {
@@ -92,7 +145,14 @@ async function analyzeImage(imageBase64) {
             }
           ]
         }
-      ]
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        topP: 0.8,
+        topK: 40,
+        maxOutputTokens: 2048,
+        responseMimeType: "application/json"
+      }
     };
     const response = await fetch(endpoint, {
       method: "POST",
@@ -106,19 +166,23 @@ async function analyzeImage(imageBase64) {
       console.error("Gemini API error:", responseData);
       return {
         text: null,
+        partners: [],
         error: responseData.error?.message || "Error processing image with Gemini API"
       };
     }
-    const extractedText = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!extractedText) {
-      return { text: null, error: "No text extracted from image" };
+    const parts = responseData.candidates?.[0]?.content?.parts || [];
+    const combined = parts.map((part) => part?.text).filter(Boolean).join("\n");
+    const parsed = parseModelResponse2(combined);
+    if (!parsed.extractedText) {
+      return { text: null, partners: [], error: "No text extracted from image" };
     }
-    return { text: extractedText, error: null };
+    return { text: parsed.extractedText, partners: parsed.partners, error: null };
   } catch (error) {
     console.error("Gemini API error:", error);
     return {
       text: null,
-      error: error.message || "Failed to process image with Gemini API"
+      partners: [],
+      error: error?.message || "Failed to process image with Gemini API"
     };
   }
 }
@@ -312,14 +376,15 @@ app.post("/api/ocr", upload.single("image"), async (req, res) => {
     }
     const imageBase64 = req.file.buffer.toString("base64");
     const result = await analyzeImage(imageBase64);
-    if (!result.text) {
+    if (!result.text && result.partners.length === 0) {
       return res.status(500).json({
         error: result.error || "Failed to extract text from image",
         suggestManualEntry: true
       });
     }
-    const partnerHours = extractPartnerHours(result.text);
-    const formattedText = formatOCRResult(result.text);
+    const transcription = result.text ?? result.partners.map((partner) => `${partner.name}: ${partner.hours}`).join("\n");
+    const partnerHours = result.partners.length > 0 ? result.partners : extractPartnerHours(transcription);
+    const formattedText = formatOCRResult(transcription);
     res.json({
       extractedText: formattedText,
       partnerHours

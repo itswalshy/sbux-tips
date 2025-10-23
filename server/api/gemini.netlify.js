@@ -49,10 +49,176 @@ const rateLimiter = new RateLimiter();
 // Sleep utility function
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+function buildJsonPrompt() {
+  return `You are an OCR and schedule parsing assistant. Carefully transcribe every legible character in the provided image.
+
+Return **only** a JSON object that matches this schema exactly:
+{
+  "extracted_text": "<full transcription with line breaks>",
+  "partners": [
+    {
+      "name": "Full Name",
+      "hours": 0
+    }
+  ]
+}
+
+Guidelines:
+- Preserve the order of the names as they appear from top to bottom or left to right.
+- Use decimal hours where necessary (e.g. 23.5 for 23 hours 30 minutes).
+- Include every partner or employee that has associated hours. If none exist, return an empty array.
+- Do not include commentary, code fences, or additional fields.
+- Ensure the JSON is valid and parsable.`;
+}
+
+function extractPartnerHoursFromLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const colonIndex = trimmed.lastIndexOf(':');
+  if (colonIndex > 0) {
+    const name = trimmed.substring(0, colonIndex).trim();
+    const hoursText = trimmed.substring(colonIndex + 1).trim();
+    const hours = parseFloat(hoursText);
+    if (name && !Number.isNaN(hours)) {
+      return { name, hours };
+    }
+  }
+
+  const patterns = [
+    /^(.+?)\s+-\s+(\d+(?:\.\d+)?)$/,
+    /^(.+?)\s+\((\d+(?:\.\d+)?)\)$/,
+    /^(.+?)\s+(\d+(?:\.\d+)?)$/
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match) {
+      const name = match[1].trim();
+      const hours = parseFloat(match[2]);
+      if (name && !Number.isNaN(hours)) {
+        return { name, hours };
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractMultiplePartnersFromText(text) {
+  const result = [];
+  const cleanedText = text.replace(/[•·]\s*/g, '\n').replace(/\s{2,}/g, ' ').trim();
+  const patterns = [
+    /([A-Za-z][A-Za-z\s\.\-']+?)[\s\-:]+(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s*\((\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)\)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s+(\d+(?:\.\d+)?)\s*h(?:\b|ours|rs)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)[\s\-:]+(\d+(?:\.\d+)?)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s+(\d+(?:\.\d+)?)/gi
+  ];
+
+  for (const pattern of patterns) {
+    const temp = [];
+    pattern.lastIndex = 0;
+
+    let match;
+    while ((match = pattern.exec(cleanedText)) !== null) {
+      const name = match[1].trim();
+      const hours = parseFloat(match[2]);
+      if (name && !Number.isNaN(hours)) {
+        temp.push({ name, hours });
+      }
+    }
+
+    if (temp.length > 0) {
+      return temp;
+    }
+  }
+
+  return result;
+}
+
+function fallbackExtractPartners(text) {
+  if (!text) {
+    return [];
+  }
+
+  const normalized = text.replace(/\r\n?/g, '\n');
+
+  if (normalized.includes('\n')) {
+    const partners = [];
+    for (const line of normalized.split('\n')) {
+      const parsed = extractPartnerHoursFromLine(line);
+      if (parsed) {
+        partners.push(parsed);
+      }
+    }
+    if (partners.length > 0) {
+      return partners;
+    }
+  }
+
+  const items = extractMultiplePartnersFromText(normalized);
+  if (items.length > 0) {
+    const map = new Map();
+    for (const item of items) {
+      const key = item.name.replace(/\s+/g, ' ').trim();
+      if (!key) {
+        continue;
+      }
+      map.set(key, item.hours);
+    }
+    return Array.from(map.entries()).map(([name, hours]) => ({ name, hours }));
+  }
+
+  return [];
+}
+
+function parseModelResponse(rawText) {
+  if (!rawText) {
+    return { extractedText: '', partners: [] };
+  }
+
+  try {
+    const parsed = JSON.parse(rawText);
+    const extractedText = typeof parsed.extracted_text === 'string' ? parsed.extracted_text.trim() : '';
+    const partners = Array.isArray(parsed.partners)
+      ? parsed.partners.map(entry => {
+          if (!entry || typeof entry !== 'object') {
+            return null;
+          }
+
+          const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+          const hoursValue = typeof entry.hours === 'number'
+            ? entry.hours
+            : typeof entry.hours === 'string'
+              ? parseFloat(entry.hours)
+              : NaN;
+
+          if (!name || Number.isNaN(hoursValue)) {
+            return null;
+          }
+
+          return { name, hours: hoursValue };
+        }).filter(Boolean)
+      : [];
+
+    return { extractedText, partners };
+  } catch (error) {
+    const cleaned = rawText.trim();
+    return {
+      extractedText: cleaned,
+      partners: cleaned ? fallbackExtractPartners(cleaned) : []
+    };
+  }
+}
+
 /**
  * Analyzes an image using Google's Gemini API with rate limiting and retry logic
  * @param {string} imageBase64 - Base64 encoded image data
- * @returns {Promise<{text: string|null, error: string|null}>} - Extracted text or error
+ * @returns {Promise<{text: string|null, partners: Array<{name: string, hours: number}>, error: string|null}>}
  */
 export async function analyzeImage(imageBase64) {
   // Check rate limit before making request
@@ -70,37 +236,18 @@ export async function analyzeImage(imageBase64) {
       
       if (!apiKey) {
         console.error("No Gemini API key provided");
-        return { text: null, error: "API key missing. Please configure the Gemini API key in environment variables." };
+        return { text: null, partners: [], error: "API key missing. Please configure the Gemini API key in environment variables." };
       }
       
       // Google Gemini API endpoint - Updated to use the latest Flash alias
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${apiKey}`;
-    
+
       // Construct the request body with the image and prompt
       const requestBody = {
         contents: [
           {
             parts: [
-              {
-                text: `
-                  Extract ALL TEXT from this image first. Then identify and extract ALL partner names and their tippable hours from the text.
-                  
-                  Look for patterns indicating partner names followed by hours, such as:
-                  - "Name: X hours" or "Name: Xh"
-                  - "Name - X hours"
-                  - "Name (X hours)"
-                  - Any text that includes names with numeric values that could represent hours
-                  
-                  Return EACH partner's full name followed by their hours, with one partner per line.
-                  Format the output exactly like this:
-                  John Smith: 32
-                  Maria Garcia: 24.5
-                  Alex Johnson: 18.75
-                  
-                  Make sure to include ALL partners mentioned in the image, not just the first one.
-                  If hours are not explicitly labeled, look for numeric values near names that could represent hours.
-                `
-              },
+              { text: buildJsonPrompt() },
               {
                 inline_data: {
                   mime_type: "image/jpeg",
@@ -115,6 +262,7 @@ export async function analyzeImage(imageBase64) {
           topP: 0.8,
           topK: 40,
           maxOutputTokens: 2048,
+          responseMimeType: "application/json"
         }
       };
       
@@ -154,27 +302,38 @@ export async function analyzeImage(imageBase64) {
         }
         
         console.error("Gemini API error:", responseData);
-        return { 
-          text: null, 
+        return {
+          text: null,
+          partners: [],
           error: errorMessage
         };
       }
-      
-      // Extract text from Gemini response
-      const extractedText = responseData.candidates?.[0]?.content?.parts?.[0]?.text;
-      
-      if (!extractedText) {
-        return { text: null, error: "No text extracted from image" };
+
+      const parts = responseData.candidates?.[0]?.content?.parts || [];
+      const combined = parts.map(part => part?.text).filter(Boolean).join("\n");
+      const parsed = parseModelResponse(combined);
+
+      if (!parsed.extractedText && parsed.partners.length === 0) {
+        return { text: null, partners: [], error: "No text extracted from image" };
       }
-      
-      return { text: extractedText, error: null };
-      
+
+      const partners = parsed.partners.length > 0
+        ? parsed.partners
+        : fallbackExtractPartners(parsed.extractedText);
+
+      return {
+        text: parsed.extractedText || partners.map(partner => `${partner.name}: ${partner.hours}`).join("\n"),
+        partners,
+        error: null
+      };
+
     } catch (error) {
       // If this is the last attempt, return the error
       if (attempt === RATE_LIMIT.maxRetries) {
         console.error("Gemini API error (final attempt):", error);
-        return { 
-          text: null, 
+        return {
+          text: null,
+          partners: [],
           error: error.message || "Failed to process image with Gemini API"
         };
       }
@@ -190,8 +349,9 @@ export async function analyzeImage(imageBase64) {
   }
   
   // This should never be reached, but just in case
-  return { 
+  return {
     text: null,
+    partners: [],
     error: "Maximum retry attempts exceeded."
   };
 }

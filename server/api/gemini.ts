@@ -41,12 +41,14 @@ const rateLimiter = new RateLimiter();
 // Sleep utility function
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+interface GeminiContentPart {
+  text?: string;
+}
+
 interface GeminiResponse {
-  candidates: {
-    content: {
-      parts: {
-        text?: string;
-      }[];
+  candidates?: {
+    content?: {
+      parts?: GeminiContentPart[];
     };
   }[];
 }
@@ -85,17 +87,211 @@ interface AnalyzeOptions {
   azureVision?: AzureVisionOptions;
 }
 
+type PartnerRecord = { name: string; hours: number };
+
+type AnalyzeImageResult = {
+  text: string | null;
+  partners: PartnerRecord[];
+  error?: string;
+};
+
+function parseModelResponse(rawText: string | undefined): { extractedText: string | null; partners: PartnerRecord[] } {
+  if (!rawText) {
+    return { extractedText: null, partners: [] };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (error) {
+    const cleaned = rawText.trim();
+    return {
+      extractedText: cleaned || null,
+      partners: cleaned ? fallbackExtractPartnerHours(cleaned) : [],
+    };
+  }
+
+  const maybeObject = parsed as {
+    extracted_text?: unknown;
+    partners?: unknown;
+  };
+
+  const extractedText = typeof maybeObject.extracted_text === "string" ? maybeObject.extracted_text.trim() : null;
+
+  const partnersArray: PartnerRecord[] = Array.isArray(maybeObject.partners)
+    ? maybeObject.partners
+        .map((entry) => {
+          if (!entry || typeof entry !== "object") {
+            return null;
+          }
+
+          const name = (entry as { name?: unknown }).name;
+          const hours = (entry as { hours?: unknown }).hours;
+
+          if (typeof name !== "string") {
+            return null;
+          }
+
+          const numericHours = typeof hours === "number" ? hours : typeof hours === "string" ? parseFloat(hours) : NaN;
+
+          if (!name.trim() || Number.isNaN(numericHours)) {
+            return null;
+          }
+
+          return {
+            name: name.trim(),
+            hours: numericHours,
+          };
+        })
+        .filter((value): value is PartnerRecord => Boolean(value))
+    : [];
+
+  return {
+    extractedText: extractedText ?? (rawText.trim() || null),
+    partners: partnersArray,
+  };
+}
+
+function buildJsonPrompt(): string {
+  return `You are an OCR and schedule parsing assistant. Carefully transcribe every legible character in the provided image.
+
+Return **only** a JSON object that matches this schema exactly:
+{
+  "extracted_text": "<full transcription with line breaks>",
+  "partners": [
+    {
+      "name": "Full Name",
+      "hours": 0
+    }
+  ]
+}
+
+Guidelines:
+- Preserve the order of the names as they appear from top to bottom or left to right.
+- Use decimal hours where necessary (e.g. 23.5 for 23 hours 30 minutes).
+- Include every partner or employee that has associated hours. If none exist, return an empty array.
+- Do not include commentary, code fences, or additional fields.
+- Ensure the JSON is valid and parsable.`;
+}
+
+function extractPartnerHoursFromLine(line: string): PartnerRecord | null {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const colonIndex = trimmed.lastIndexOf(":");
+  if (colonIndex > 0) {
+    const name = trimmed.substring(0, colonIndex).trim();
+    const hoursText = trimmed.substring(colonIndex + 1).trim();
+    const hours = Number.parseFloat(hoursText);
+    if (name && !Number.isNaN(hours)) {
+      return { name, hours };
+    }
+  }
+
+  const patterns: RegExp[] = [
+    /^(.+?)\s+-\s+(\d+(?:\.\d+)?)$/,
+    /^(.+?)\s+\((\d+(?:\.\d+)?)\)$/,
+    /^(.+?)\s+(\d+(?:\.\d+)?)$/,
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match) {
+      const name = match[1].trim();
+      const hours = Number.parseFloat(match[2]);
+      if (name && !Number.isNaN(hours)) {
+        return { name, hours };
+      }
+    }
+  }
+
+  return null;
+}
+
+function extractMultiplePartnersFromText(text: string): PartnerRecord[] {
+  const result: PartnerRecord[] = [];
+  const cleanedText = text.replace(/[•·]\s*/g, "\n").replace(/\s{2,}/g, " ").trim();
+  const patterns: RegExp[] = [
+    /([A-Za-z][A-Za-z\s\.\-']+?)[\s\-:]+(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s*\((\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)\)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s*-\s*(\d+(?:\.\d+)?)\s*(?:hours|hrs?|h)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s+(\d+(?:\.\d+)?)\s*h(?:\b|ours|rs)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)[\s\-:]+(\d+(?:\.\d+)?)/gi,
+    /([A-Za-z][A-Za-z\s\.\-']+?)\s+(\d+(?:\.\d+)?)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    const temp: PartnerRecord[] = [];
+    pattern.lastIndex = 0;
+
+    let match: RegExpExecArray | null;
+    // eslint-disable-next-line no-cond-assign
+    while ((match = pattern.exec(cleanedText)) !== null) {
+      const name = match[1].trim();
+      const hours = Number.parseFloat(match[2]);
+      if (name && !Number.isNaN(hours)) {
+        temp.push({ name, hours });
+      }
+    }
+
+    if (temp.length > 0) {
+      return temp;
+    }
+  }
+
+  return result;
+}
+
+function fallbackExtractPartnerHours(text: string): PartnerRecord[] {
+  if (!text) {
+    return [];
+  }
+
+  const normalized = text.replace(/\r\n?/g, "\n");
+
+  if (normalized.includes("\n")) {
+    const partners: PartnerRecord[] = [];
+    for (const line of normalized.split("\n")) {
+      const parsed = extractPartnerHoursFromLine(line);
+      if (parsed) {
+        partners.push(parsed);
+      }
+    }
+    if (partners.length > 0) {
+      return partners;
+    }
+  }
+
+  const items = extractMultiplePartnersFromText(normalized);
+  if (items.length > 0) {
+    const map = new Map<string, number>();
+    for (const item of items) {
+      const key = item.name.replace(/\s+/g, " ").trim();
+      if (!key) {
+        continue;
+      }
+      map.set(key, item.hours);
+    }
+    return Array.from(map.entries()).map(([name, hours]) => ({ name, hours }));
+  }
+
+  return [];
+}
+
 export async function analyzeImage(
   imageBase64: string,
   mimeType: string = "image/jpeg",
   apiKey?: string,
   options?: AnalyzeOptions
-): Promise<{ text: string | null; error?: string }> {
+): Promise<AnalyzeImageResult> {
   // Check rate limit before making request
   if (!rateLimiter.canMakeRequest()) {
     const waitTime = rateLimiter.getTimeUntilNextRequest();
     return {
       text: null,
+      partners: [],
       error: GEMINI_RATE_LIMIT_CONFIG.messages.rateLimitExceeded(waitTime)
     };
   }
@@ -104,24 +300,7 @@ export async function analyzeImage(
 
   for (let attempt = 0; attempt <= GEMINI_RATE_LIMIT_CONFIG.maxRetries; attempt++) {
     try {
-      const promptText = `
-      Extract ALL TEXT from this image first. Then identify and extract ALL partner names and their tippable hours from the text.
-      
-      Look for patterns indicating partner names followed by hours, such as:
-      - "Name: X hours" or "Name: Xh"
-      - "Name - X hours"
-      - "Name (X hours)"
-      - Any text that includes names with numeric values that could represent hours
-      
-      Return EACH partner's full name followed by their hours, with one partner per line.
-      Format the output exactly like this:
-      John Smith: 32
-      Maria Garcia: 24.5
-      Alex Johnson: 18.75
-      
-      Make sure to include ALL partners mentioned in the image, not just the first one.
-      If hours are not explicitly labeled, look for numeric values near names that could represent hours.
-    `;
+      const promptText = buildJsonPrompt();
 
       if (provider === "azure-openai") {
         const endpoint = options?.azure?.endpoint || process.env.AZURE_OPENAI_ENDPOINT || "";
@@ -132,6 +311,7 @@ export async function analyzeImage(
         if (!endpoint || !deployment || !azureKey) {
           return {
             text: null,
+            partners: [],
             error: "Azure OpenAI configuration missing (endpoint/deployment/api key).",
           };
         }
@@ -140,7 +320,7 @@ export async function analyzeImage(
 
         const payload = {
           messages: [
-            { role: "system", content: "You are an OCR and parsing assistant. Return only the extracted text and partner lines." },
+            { role: "system", content: "You are an OCR and parsing assistant. Return only valid JSON that matches the requested schema." },
             {
               role: "user",
               content: [
@@ -152,6 +332,7 @@ export async function analyzeImage(
           temperature: 0.1,
           max_tokens: 2048,
           top_p: 0.8,
+          response_format: { type: "json_object" },
         };
 
         const response = await fetch(url, {
@@ -166,7 +347,7 @@ export async function analyzeImage(
         if (!response.ok) {
           const errorText = await response.text();
           console.error("Azure OpenAI API error:", response.status, errorText);
-          return { text: null, error: `API Error (${response.status}): Failed to call Azure OpenAI` };
+          return { text: null, partners: [], error: `API Error (${response.status}): Failed to call Azure OpenAI` };
         }
 
         const data = await response.json() as any;
@@ -178,11 +359,13 @@ export async function analyzeImage(
           extracted = content;
         }
 
-        if (!extracted) {
-          return { text: null, error: "No text extracted from the image. Try a clearer image or manual entry." };
+        const parsed = parseModelResponse(extracted);
+
+        if (!parsed.extractedText) {
+          return { text: null, partners: [], error: "No text extracted from the image. Try a clearer image or manual entry." };
         }
 
-        return { text: extracted };
+        return { text: parsed.extractedText, partners: parsed.partners };
       } else if (provider === "azure-vision") {
         // Azure Computer Vision Read API
         const endpoint = options?.azureVision?.endpoint || process.env.AZURE_VISION_ENDPOINT || "";
@@ -192,6 +375,7 @@ export async function analyzeImage(
         if (!endpoint || !visionKey) {
           return {
             text: null,
+            partners: [],
             error: "Azure Vision configuration missing (endpoint/api key).",
           };
         }
@@ -211,13 +395,13 @@ export async function analyzeImage(
         if (!analyzeResponse.ok) {
           const errorText = await analyzeResponse.text();
           console.error("Azure Vision API error:", analyzeResponse.status, errorText);
-          return { text: null, error: `API Error (${analyzeResponse.status}): Failed to call Azure Vision` };
+          return { text: null, partners: [], error: `API Error (${analyzeResponse.status}): Failed to call Azure Vision` };
         }
 
         // Get operation location from response headers
         const operationLocation = analyzeResponse.headers.get('Operation-Location');
         if (!operationLocation) {
-          return { text: null, error: "Azure Vision: No operation location returned" };
+          return { text: null, partners: [], error: "Azure Vision: No operation location returned" };
         }
 
         // Step 2: Poll for results
@@ -238,7 +422,7 @@ export async function analyzeImage(
           if (!resultResponse.ok) {
             const errorText = await resultResponse.text();
             console.error("Azure Vision result error:", resultResponse.status, errorText);
-            return { text: null, error: `Failed to get OCR results: ${resultResponse.status}` };
+            return { text: null, partners: [], error: `Failed to get OCR results: ${resultResponse.status}` };
           }
 
           const result = await resultResponse.json() as any;
@@ -254,19 +438,20 @@ export async function analyzeImage(
               }
             }
 
-            if (!extractedText.trim()) {
-              return { text: null, error: "No text extracted from the image. Try a clearer image or manual entry." };
+            const trimmed = extractedText.trim();
+            if (!trimmed) {
+              return { text: null, partners: [], error: "No text extracted from the image. Try a clearer image or manual entry." };
             }
 
-            return { text: extractedText.trim() };
+            return { text: trimmed, partners: fallbackExtractPartnerHours(trimmed) };
           } else if (result.status === "failed") {
-            return { text: null, error: "Azure Vision OCR failed to process the image." };
+            return { text: null, partners: [], error: "Azure Vision OCR failed to process the image." };
           }
           
           // Status is still "running" or "notStarted", continue polling
         } while (attempts < maxAttempts);
 
-        return { text: null, error: "Azure Vision OCR timed out. Please try again." };
+        return { text: null, partners: [], error: "Azure Vision OCR timed out. Please try again." };
       } else {
         // Default: Google Gemini
         const geminiKey = apiKey || process.env.GEMINI_API_KEY || "";
@@ -274,6 +459,7 @@ export async function analyzeImage(
           console.error("No Gemini API key provided");
           return {
             text: null,
+            partners: [],
             error: "API key missing. Please configure the Gemini API key.",
           };
         }
@@ -301,6 +487,7 @@ export async function analyzeImage(
             topP: 0.8,
             topK: 40,
             maxOutputTokens: 2048,
+            responseMimeType: "application/json",
           },
         };
 
@@ -347,14 +534,16 @@ export async function analyzeImage(
         
         // Provide user-friendly error messages for quota issues
         if (isRateLimitError({ code: response.status, message: errorMessage })) {
-          return { 
-            text: null, 
+          return {
+            text: null,
+            partners: [],
             error: GEMINI_RATE_LIMIT_CONFIG.messages.quotaExceeded
           };
         }
-        
-        return { 
-          text: null, 
+
+        return {
+          text: null,
+          partners: [],
           error: `API Error (${response.status}): ${errorMessage}`
         };
       }
@@ -363,33 +552,39 @@ export async function analyzeImage(
         
         if (!data.candidates || data.candidates.length === 0) {
           console.error("No candidates in Gemini response");
-          return { 
+          return {
             text: null,
+            partners: [],
             error: "No text extracted from the image. Try a clearer image or manual entry."
           };
         }
-        
-        const extractedText = data.candidates[0].content.parts
-          .map(part => part.text)
-          .filter(Boolean)
+
+        const parts = data.candidates[0]?.content?.parts || [];
+        const combined = parts
+          .map(part => part?.text)
+          .filter((segment): segment is string => Boolean(segment))
           .join("\n");
-        
-        if (!extractedText) {
-          return { 
+
+        const parsed = parseModelResponse(combined);
+
+        if (!parsed.extractedText) {
+          return {
             text: null,
+            partners: [],
             error: "No text extracted from the image. Try a clearer image or manual entry."
           };
         }
-        
-        return { text: extractedText };
+
+        return { text: parsed.extractedText, partners: parsed.partners };
       }
       
     } catch (error) {
       // If this is the last attempt, return the error
       if (attempt === GEMINI_RATE_LIMIT_CONFIG.maxRetries) {
         console.error("Error calling Gemini API (final attempt):", error);
-        return { 
+        return {
           text: null,
+          partners: [],
           error: "An unexpected error occurred while processing the image."
         };
       }
@@ -405,8 +600,9 @@ export async function analyzeImage(
   }
   
   // This should never be reached, but just in case
-  return { 
+  return {
     text: null,
+    partners: [],
     error: GEMINI_RATE_LIMIT_CONFIG.messages.maxRetriesExceeded
   };
 }

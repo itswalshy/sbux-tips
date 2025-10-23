@@ -40,14 +40,21 @@ app.post("/api/ocr", upload.single("image"), async (req, res) => {
       apiVersion: (req.headers["x-azure-vision-api-version"] as string) || undefined,
     };
     const result = await analyzeImage(imageBase64, mimeType, userGeminiKey, { provider, azure, azureVision });
-    if (!result.text) {
+    if (!result.text && result.partners.length === 0) {
       return res.status(500).json({
         error: result.error || "Failed to extract text from image",
         suggestManualEntry: true,
       });
     }
-    const partnerHours = extractPartnerHours(result.text);
-    const formattedText = formatOCRResult(result.text);
+    const transcription = result.text ?? result.partners.map(partner => `${partner.name}: ${partner.hours}`).join("\n");
+    const detectedPartners = result.partners.length > 0 ? result.partners : extractPartnerHours(transcription);
+    const partnerHours = detectedPartners
+      .map((partner: { name: string; hours: number }) => ({
+        name: partner.name,
+        hours: typeof partner.hours === 'number' ? partner.hours : Number.parseFloat(String(partner.hours))
+      }))
+      .filter((partner: { name: string; hours: number }) => partner.name && !Number.isNaN(partner.hours));
+    const formattedText = formatOCRResult(transcription);
     res.json({ extractedText: formattedText, partnerHours });
   } catch (error) {
     console.error("OCR processing error:", error);

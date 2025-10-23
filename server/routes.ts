@@ -32,19 +32,27 @@ export async function registerRoutes(app: Express, skipServer = false): Promise<
       // Use Gemini API to analyze the image
       const result = await analyzeImage(imageBase64);
       
-      if (!result.text) {
+      if (!result.text && result.partners.length === 0) {
         // Return a specific error message from the API if available
-        return res.status(500).json({ 
+        return res.status(500).json({
           error: result.error || "Failed to extract text from image",
           suggestManualEntry: true
         });
       }
-      
+
       // Parse extracted text to get partner hours
-      const partnerHours = extractPartnerHours(result.text);
-      
+      const transcription = result.text ?? result.partners.map(partner => `${partner.name}: ${partner.hours}`).join("\n");
+      const detectedPartners = result.partners.length > 0
+        ? result.partners
+        : extractPartnerHours(transcription);
+
+      const partnerHours: ReturnType<typeof extractPartnerHours> = detectedPartners.map(partner => ({
+        name: partner.name,
+        hours: typeof partner.hours === "number" ? partner.hours : Number.parseFloat(String(partner.hours))
+      })).filter(partner => partner.name && !Number.isNaN(partner.hours));
+
       // Format the extracted text for display
-      const formattedText = formatOCRResult(result.text);
+      const formattedText = formatOCRResult(transcription);
       
       res.json({
         extractedText: formattedText,
