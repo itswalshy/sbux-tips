@@ -1,4 +1,4 @@
-import { DistributionData } from "@shared/schema";
+import { BillInventory, DistributionData } from "@shared/schema";
 import PartnerCard from "./PartnerCard";
 
 type PartnerPayoutsListProps = {
@@ -16,8 +16,37 @@ const getBillClass = (billStr: string): string => {
   }
 };
 
+const INVENTORY_CONFIG = [
+  { key: "twenties" as const, label: "$20" },
+  { key: "tens" as const, label: "$10" },
+  { key: "fives" as const, label: "$5" },
+  { key: "ones" as const, label: "$1" },
+];
+
+const renderInventoryPills = (inventory: BillInventory) => (
+  <div className="flex flex-wrap gap-3">
+    {INVENTORY_CONFIG.map(({ key, label }, index) => {
+      const count = inventory[key];
+      if (!count) return null;
+
+      const billClass = getBillClass(label);
+      return (
+        <div
+          key={label}
+          className={`px-4 py-2 rounded-full text-sm font-medium shadow-sm transition-all hover:shadow-md hover:scale-105 ${billClass}`}
+          style={{ animationDelay: `${0.1 + index * 0.05}s` }}
+        >
+          <div className="flex items-center">
+            <span className="font-bold mr-1">{count}</span> × {label}
+          </div>
+        </div>
+      );
+    })}
+  </div>
+);
+
 export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsListProps) {
-  const { partnerPayouts, hourlyRate, totalAmount, totalHours } = distributionData;
+  const { partnerPayouts, hourlyRate, totalAmount, totalHours, billInventorySummary } = distributionData;
   
   if (!partnerPayouts || partnerPayouts.length === 0) {
     return null;
@@ -85,19 +114,17 @@ export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsL
               <div className="flex flex-wrap gap-3">
                 {Object.entries(billsNeeded)
                   .sort(([billA], [billB]) => {
-                    // Extract denominationA and denominationB from the keys (e.g., "$20" -> 20)
                     const denominationA = parseInt(billA.replace('$', ''));
                     const denominationB = parseInt(billB.replace('$', ''));
-                    // Sort in descending order (largest denomination first)
                     return denominationB - denominationA;
                   })
                   .map(([bill, count], index) => {
                     const billClass = getBillClass(bill);
                     return (
-                      <div 
-                        key={index} 
+                      <div
+                        key={bill}
                         className={`px-4 py-2 rounded-full text-sm font-medium shadow-sm transition-all hover:shadow-md hover:scale-105 ${billClass}`}
-                        style={{animationDelay: `${0.1 + (index * 0.05)}s`}}
+                        style={{ animationDelay: `${0.1 + index * 0.05}s` }}
                       >
                         <div className="flex items-center">
                           <span className="font-bold mr-1">{count}</span> × {bill}
@@ -108,6 +135,30 @@ export default function PartnerPayoutsList({ distributionData }: PartnerPayoutsL
               </div>
             </div>
           </div>
+
+          {billInventorySummary && (
+            <div className="animate-fadeUp" style={{ animationDelay: "0.2s" }}>
+              <h3 className="flex items-center font-medium mb-3 text-[#f5f5f5]">
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-1 text-[#93EC93]" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6a2 2 0 012-2h3.5a2 2 0 011.6.8l1.9 2.4H18a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V6z" />
+                </svg>
+                Manual bill summary:
+              </h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <div className="p-4 rounded-lg bg-[#364949] border border-[#3d6262]">
+                  <p className="text-xs text-[#9fd6e9] mb-2 uppercase tracking-wide">Provided</p>
+                  {renderInventoryPills(billInventorySummary.requested)}
+                </div>
+                <div className="p-4 rounded-lg bg-[#364949] border border-[#3d6262]">
+                  <p className="text-xs text-[#9fd6e9] mb-2 uppercase tracking-wide">Remaining</p>
+                  {billInventorySummary && renderInventoryPills(billInventorySummary.remaining)}
+                  {Object.values(billInventorySummary.remaining).every((count) => count === 0) && (
+                    <p className="text-xs text-[#ffeed6]">All manual bills were used exactly.</p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
       

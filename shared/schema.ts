@@ -62,6 +62,15 @@ export type PartnerPayout = {
   }>;
 }
 
+export const billInventorySchema = z.object({
+  twenties: z.number().int().min(0).default(0),
+  tens: z.number().int().min(0).default(0),
+  fives: z.number().int().min(0).default(0),
+  ones: z.number().int().min(0).default(0),
+});
+
+export type BillInventory = z.infer<typeof billInventorySchema>;
+
 // Schema for OCR extraction validation
 export const partnerHoursSchema = z.array(
   z.object({
@@ -78,4 +87,8 @@ export type DistributionData = {
   totalHours: number;
   hourlyRate: number;
   partnerPayouts: PartnerPayout[];
+  billInventorySummary?: {
+    requested: BillInventory;
+    remaining: BillInventory;
+  };
 }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useToast } from "@/hooks/use-toast";
 import FileDropzone from "@/components/FileDropzone";
 import ResultsSummaryCard from "@/components/ResultsSummaryCard";
@@ -6,10 +6,21 @@ import PartnerPayoutsList from "@/components/PartnerPayoutsList";
 import { useTipContext } from "@/context/TipContext";
 import { apiRequest } from "@/lib/queryClient";
 import { calculateHourlyRate } from "@/lib/utils";
+import { calculateInventoryTotal } from "@/lib/billCalc";
+import BillInventoryForm from "@/components/BillInventoryForm";
+import { Switch } from "@/components/ui/switch";
+import { BillInventory } from "@shared/schema";
 
 export default function Home() {
   const [tipAmount, setTipAmount] = useState<number | ''>('');
   const [isCalculating, setIsCalculating] = useState(false);
+  const [useManualBills, setUseManualBills] = useState(false);
+  const [manualBillInventory, setManualBillInventory] = useState<BillInventory>({
+    twenties: 0,
+    tens: 0,
+    fives: 0,
+    ones: 0,
+  });
   
   const { toast } = useToast();
   const { 
@@ -17,6 +28,8 @@ export default function Home() {
     distributionData, 
     setDistributionData
   } = useTipContext();
+
+  const manualInventoryTotal = useMemo(() => calculateInventoryTotal(manualBillInventory), [manualBillInventory]);
 
   const handleCalculate = async () => {
     if (!partnerHours.length) {
@@ -36,9 +49,29 @@ export default function Home() {
       });
       return;
     }
-    
+
+    if (useManualBills) {
+      if (manualInventoryTotal === 0) {
+        toast({
+          title: "No bills entered",
+          description: "Add at least one bill when manual bill counts are enabled",
+          variant: "destructive"
+        });
+        return;
+      }
+
+      if (manualInventoryTotal !== Number(tipAmount)) {
+        toast({
+          title: "Bill totals do not match",
+          description: "The sum of your manual bills must equal the total tip amount.",
+          variant: "destructive"
+        });
+        return;
+      }
+    }
+
     setIsCalculating(true);
-    
+
     try {
       const totalHours = partnerHours.reduce((sum, partner) => sum + partner.hours, 0);
       const hourlyRate = calculateHourlyRate(Number(tipAmount), totalHours);
@@ -50,22 +83,43 @@ export default function Home() {
           partnerHours,
           totalAmount: Number(tipAmount),
           totalHours,
-          hourlyRate
+          hourlyRate,
+          billInventory: useManualBills ? manualBillInventory : undefined
         }
       );
-      
+
       const calculatedData = await res.json();
       setDistributionData(calculatedData);
-      
+
       toast({
         title: "Distribution calculated",
         description: "Tip distribution calculated successfully",
       });
     } catch (error) {
       console.error(error);
+      let description = "An error occurred while calculating the distribution";
+
+      if (error instanceof Error) {
+        const match = error.message.match(/^[0-9]{3}:\s*(.*)$/);
+        if (match) {
+          try {
+            const parsed = JSON.parse(match[1]);
+            if (parsed?.error) {
+              description = parsed.error;
+            } else {
+              description = match[1];
+            }
+          } catch {
+            description = match[1];
+          }
+        } else if (error.message) {
+          description = error.message;
+        }
+      }
+
       toast({
         title: "Calculation failed",
-        description: "An error occurred while calculating the distribution",
+        description,
         variant: "destructive"
       });
     } finally {
@@ -115,9 +169,40 @@ export default function Home() {
                   />
                 </div>
               </div>
-              
-              <button 
-                onClick={handleCalculate} 
+
+              <div className="mt-6 space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="flex items-center text-sm font-medium text-[#ffeed6]">
+                    <Switch
+                      checked={useManualBills}
+                      onCheckedChange={(checked) => setUseManualBills(Boolean(checked))}
+                      className="mr-3 data-[state=checked]:bg-[#93ec93] data-[state=unchecked]:bg-[#364949]"
+                      aria-label="Toggle manual bill counts"
+                    />
+                    Use manual bill counts
+                  </label>
+                  {useManualBills && (
+                    <button
+                      type="button"
+                      onClick={() => setTipAmount(manualInventoryTotal)}
+                      className="text-xs font-medium text-[#9fd6e9] hover:text-[#93ec93] transition-colors"
+                    >
+                      Use ${manualInventoryTotal.toFixed(2)} as total
+                    </button>
+                  )}
+                </div>
+
+                {useManualBills && (
+                  <BillInventoryForm
+                    value={manualBillInventory}
+                    onChange={setManualBillInventory}
+                    totalTipAmount={tipAmount}
+                  />
+                )}
+              </div>
+
+              <button
+                onClick={handleCalculate}
                 className="text-[#364949] bg-[#93ec93] hover:bg-opacity-90 transition-all duration-300 inline-flex h-12 w-full justify-center items-center gap-2 whitespace-nowrap font-medium rounded-md px-4 py-3 shadow-md hover:shadow-lg file-dropzone-btn"
                 disabled={isCalculating}
               >

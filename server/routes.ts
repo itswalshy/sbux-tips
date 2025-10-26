@@ -5,8 +5,8 @@ import multer from "multer";
 import { analyzeImage } from "./api/gemini";
 import { extractPartnerHours, formatOCRResult } from "../client/src/lib/formatUtils";
 import { calculatePayout } from "../client/src/lib/utils";
-import { roundAndCalculateBills } from "../client/src/lib/billCalc";
-import { partnerHoursSchema } from "@shared/schema";
+import { allocateBillBreakdowns, calculateInventoryTotal, roundAndCalculateBills } from "../client/src/lib/billCalc";
+import { billInventorySchema, partnerHoursSchema, PartnerHours, PartnerPayout, BillInventory } from "@shared/schema";
 
 // Setup file uploads
 const upload = multer({
@@ -62,20 +62,21 @@ export async function registerRoutes(app: Express, skipServer = false): Promise<
   // Calculate tip distribution
   app.post("/api/distributions/calculate", async (req, res) => {
     try {
-      const { partnerHours, totalAmount, totalHours, hourlyRate } = req.body;
+      const { partnerHours, totalAmount, totalHours, hourlyRate, billInventory } = req.body;
       
       // Validate partner hours
+      let validatedPartnerHours: PartnerHours;
       try {
-        partnerHoursSchema.parse(partnerHours);
+        validatedPartnerHours = partnerHoursSchema.parse(partnerHours);
       } catch (error) {
         return res.status(400).json({ error: "Invalid partner hours data" });
       }
-      
+
       // Calculate payout for each partner
-      const partnerPayouts = partnerHours.map(partner => {
+      let partnerPayouts: PartnerPayout[] = validatedPartnerHours.map(partner => {
         const payout = calculatePayout(partner.hours, hourlyRate);
         const { rounded, billBreakdown } = roundAndCalculateBills(payout);
-        
+
         return {
           name: partner.name,
           hours: partner.hours,
@@ -84,14 +85,56 @@ export async function registerRoutes(app: Express, skipServer = false): Promise<
           billBreakdown
         };
       });
-      
+
+      let billInventorySummary: { requested: BillInventory; remaining: BillInventory } | undefined;
+
+      if (billInventory) {
+        let parsedInventory;
+        try {
+          parsedInventory = billInventorySchema.parse(billInventory);
+        } catch {
+          return res.status(400).json({
+            error: "Invalid manual bill counts provided.",
+          });
+        }
+        const inventoryTotal = calculateInventoryTotal(parsedInventory);
+
+        if (Math.round(inventoryTotal) !== Math.round(totalAmount)) {
+          return res.status(400).json({
+            error: "Provided bill counts do not add up to the total tip amount.",
+          });
+        }
+
+        const allocationResult = allocateBillBreakdowns(
+          partnerPayouts.map((partner) => partner.rounded),
+          parsedInventory
+        );
+
+        if (!allocationResult) {
+          return res.status(400).json({
+            error: "Unable to allocate bills using the provided counts. Please adjust the manual bill counts.",
+          });
+        }
+
+        partnerPayouts = partnerPayouts.map((partner, index) => ({
+          ...partner,
+          billBreakdown: allocationResult.breakdowns[index],
+        }));
+
+        billInventorySummary = {
+          requested: parsedInventory,
+          remaining: allocationResult.remaining,
+        };
+      }
+
       const distributionData = {
         totalAmount,
         totalHours,
         hourlyRate,
-        partnerPayouts
+        partnerPayouts,
+        billInventorySummary,
       };
-      
+
       res.json(distributionData);
     } catch (error) {
       console.error("Distribution calculation error:", error);
