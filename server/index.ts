@@ -5,7 +5,7 @@ import { setupVite, serveStatic, log } from "./vite";
 
 // Check for required environment variables in production
 if (process.env.NODE_ENV === "production") {
-  const requiredEnvVars = ["SESSION_SECRET", "GEMINI_API_KEY"];
+  const requiredEnvVars = ["SESSION_SECRET"];
   const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
   
   if (missingEnvVars.length > 0) {
@@ -69,10 +69,9 @@ app.use((req, res, next) => {
     serveStatic(app);
   }
 
-  // ALWAYS serve the app on port 5000
-  // this serves both the API and the client.
-  // It is the only port that is not firewalled.
-  const port = 5000;
+  // Use PORT from environment or default to 5000
+  // Render provides PORT automatically
+  const port = Number(process.env.PORT) || 5000;
   const listenOptions: { port: number; host: string; reusePort?: boolean } = {
     port,
     host: "0.0.0.0",

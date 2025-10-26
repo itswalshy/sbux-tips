@@ -6,5 +6,8 @@ vite.config.ts.*
 *.tar.gz
 .env
 .env.example
+.env.local
 # Local Netlify folder
 .netlify
+# Render
+render.yaml.bak
