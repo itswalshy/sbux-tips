@@ -16,7 +16,7 @@ services:
         generateValue: true
       - key: OCR_ENGINE
         value: auto
-      # Add your Azure credentials in Render dashboard under Environment
+      # Azure credentials should be added in Render dashboard under Environment
       # - key: AZURE_CV_KEY
       #   sync: false
       # - key: AZURE_CV_ENDPOINT
